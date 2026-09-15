@@ -1,9 +1,10 @@
+
 "use strict";
 
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT) || 8080;
 
 const STATIONS = {
   AM: {
@@ -40,7 +41,7 @@ function sendJson(ws, payload) {
     ws.send(JSON.stringify(payload));
     return true;
   } catch (error) {
-    log("[ERROR] Failed to send JSON:", error.message);
+    log("[ERROR] Could not send JSON:", error.message);
     return false;
   }
 }
@@ -52,18 +53,12 @@ function getClientIp(request) {
     return forwarded.split(",")[0].trim();
   }
 
-  return (
-    request.socket.remoteAddress ||
-    "unknown"
-  ).replace("::ffff:", "");
+  return String(request.socket.remoteAddress || "unknown")
+    .replace("::ffff:", "");
 }
 
 function cleanValue(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  return value;
+  return value === undefined || value === null ? null : value;
 }
 
 function buildMetadata(stationKey, registration) {
@@ -80,17 +75,28 @@ function buildMetadata(stationKey, registration) {
   };
 }
 
+function isSocketOpen(ws) {
+  return Boolean(
+    ws &&
+    ws.readyState === WebSocket.OPEN
+  );
+}
+
+function isActiveTransmitter(ws) {
+  return Boolean(
+    ws &&
+    ws.registered === true &&
+    isSocketOpen(ws)
+  );
+}
+
 function getPublicStationStatus(stationKey) {
   const room = STATIONS[stationKey];
   const transmitter = room.transmitter;
 
   return {
     station: stationKey,
-    transmitterActive: Boolean(
-      transmitter &&
-      transmitter.readyState === WebSocket.OPEN &&
-      transmitter.registered === true
-    ),
+    transmitterActive: isActiveTransmitter(transmitter),
     transmitter: transmitter
       ? {
           casterId: transmitter.casterId || null,
@@ -109,11 +115,7 @@ function sendReceiverStatus(stationKey, receiver) {
   sendJson(receiver, {
     type: "status",
     station: stationKey,
-    transmitterActive: Boolean(
-      room.transmitter &&
-      room.transmitter.readyState === WebSocket.OPEN &&
-      room.transmitter.registered === true
-    ),
+    transmitterActive: isActiveTransmitter(room.transmitter),
     receivers: room.receivers.size,
     metadata: room.metadata
   });
@@ -123,8 +125,17 @@ function broadcastToReceivers(stationKey, payload) {
   const room = STATIONS[stationKey];
 
   for (const receiver of room.receivers) {
-    if (receiver.readyState === WebSocket.OPEN) {
-      sendJson(receiver, payload);
+    if (!isSocketOpen(receiver)) {
+      continue;
+    }
+
+    try {
+      receiver.send(JSON.stringify(payload));
+    } catch (error) {
+      log(
+        `[${stationKey}] Receiver JSON send failed:`,
+        error.message
+      );
     }
   }
 }
@@ -135,7 +146,7 @@ function broadcastStreamInfo(stationKey) {
   broadcastToReceivers(stationKey, {
     type: "stream-info",
     station: stationKey,
-    transmitterActive: Boolean(room.transmitter),
+    transmitterActive: isActiveTransmitter(room.transmitter),
     metadata: room.metadata
   });
 }
@@ -143,6 +154,9 @@ function broadcastStreamInfo(stationKey) {
 function clearTransmitter(stationKey, ws) {
   const room = STATIONS[stationKey];
 
+  /*
+   * Do not clear a newer transmitter when an old socket closes.
+   */
   if (room.transmitter !== ws) {
     return;
   }
@@ -164,10 +178,14 @@ function clearTransmitter(stationKey, ws) {
 function rejectTransmitter(ws, stationKey, reason, extra = {}) {
   log(`[${stationKey}] Transmitter rejected: ${reason}`);
 
+  /*
+   * Send the rejection only after the registration has been
+   * received and checked.
+   */
   sendJson(ws, {
     type: "transmitter-rejected",
-    reason,
     station: stationKey,
+    reason,
     ...extra
   });
 
@@ -176,13 +194,20 @@ function rejectTransmitter(ws, stationKey, reason, extra = {}) {
       ws.readyState === WebSocket.OPEN ||
       ws.readyState === WebSocket.CONNECTING
     ) {
-      ws.close(1008, reason);
+      try {
+        ws.close(1008, reason);
+      } catch (error) {
+        log(
+          `[${stationKey}] Failed to close rejected transmitter:`,
+          error.message
+        );
+      }
     }
-  }, 50);
+  }, 100);
 }
 
-function isValidRegistration(registration) {
-  return (
+function validRegistration(registration) {
+  return Boolean(
     registration &&
     typeof registration === "object" &&
     registration.type === "register-transmitter"
@@ -192,24 +217,21 @@ function isValidRegistration(registration) {
 function handleTransmitterMessage(stationKey, ws, data, isBinary) {
   const room = STATIONS[stationKey];
 
-  log(
-    `[${stationKey}] Message received: ${
-      isBinary
-        ? `BINARY ${data.length} bytes`
-        : data.toString()
-    }`
-  );
-
   /*
-   * The first message must be the transmitter registration JSON.
+   * The first message must be registration JSON.
    */
   if (!ws.registered) {
     if (isBinary) {
+      log(
+        `[${stationKey}] Binary packet received before registration`
+      );
+
       rejectTransmitter(
         ws,
         stationKey,
         "REGISTRATION_REQUIRED"
       );
+
       return;
     }
 
@@ -223,32 +245,30 @@ function handleTransmitterMessage(stationKey, ws, data, isBinary) {
         stationKey,
         "INVALID_REGISTRATION_JSON"
       );
+
       return;
     }
 
-    log(`[${stationKey}] Registration payload:`, registration);
+    log(
+      `[${stationKey}] Registration payload received:`,
+      registration
+    );
 
-    if (!isValidRegistration(registration)) {
+    if (!validRegistration(registration)) {
       rejectTransmitter(
         ws,
         stationKey,
         "INVALID_REGISTRATION_TYPE"
       );
+
       return;
     }
 
     /*
-     * Only one transmitter is allowed per station.
-     * AM and FM have separate transmitter slots.
+     * Only one transmitter is allowed for each station.
+     * AM and FM are completely independent.
      */
-    if (
-      room.transmitter &&
-      room.transmitter !== ws &&
-      (
-        room.transmitter.readyState === WebSocket.OPEN ||
-        room.transmitter.readyState === WebSocket.CONNECTING
-      )
-    ) {
+    if (isActiveTransmitter(room.transmitter)) {
       rejectTransmitter(
         ws,
         stationKey,
@@ -257,6 +277,7 @@ function handleTransmitterMessage(stationKey, ws, data, isBinary) {
           activeCasterId: room.transmitter.casterId || null
         }
       );
+
       return;
     }
 
@@ -265,17 +286,24 @@ function handleTransmitterMessage(stationKey, ws, data, isBinary) {
     ws.registration = registration;
 
     room.transmitter = ws;
-    room.metadata = buildMetadata(stationKey, registration);
+    room.metadata = buildMetadata(
+      stationKey,
+      registration
+    );
 
     log(
       `[+] ${stationKey} transmitter registered:`,
       room.metadata
     );
 
+    /*
+     * This is the only initial response sent after registration.
+     * Do not send registration-required when the socket connects.
+     */
     sendJson(ws, {
       type: "transmitter-accepted",
       station: stationKey,
-      endpoint: STATIONS[stationKey].txPath,
+      endpoint: room.txPath,
       server: "AudioBridge",
       ...room.metadata
     });
@@ -286,40 +314,39 @@ function handleTransmitterMessage(stationKey, ws, data, isBinary) {
   }
 
   /*
-   * Ignore messages from an old transmitter socket after replacement.
+   * Ignore packets from an obsolete transmitter socket.
    */
   if (room.transmitter !== ws) {
     log(
-      `[${stationKey}] Ignoring message from inactive transmitter`
+      `[${stationKey}] Ignoring packet from inactive transmitter`
     );
+
     return;
   }
 
   /*
-   * Forward audio packets unchanged.
-   * No sample-rate, channel, bitrate, or PCM conversion is performed.
+   * Forward audio data exactly as received.
+   * No conversion or format enforcement is performed.
    */
   for (const receiver of room.receivers) {
-    if (receiver.readyState === WebSocket.OPEN) {
-      try {
-        receiver.send(data, {
-          binary: isBinary
-        });
-      } catch (error) {
-        log(
-          `[${stationKey}] Failed to forward audio:`,
-          error.message
-        );
-      }
+    if (!isSocketOpen(receiver)) {
+      continue;
+    }
+
+    try {
+      receiver.send(data, {
+        binary: isBinary
+      });
+    } catch (error) {
+      log(
+        `[${stationKey}] Audio forwarding failed:`,
+        error.message
+      );
     }
   }
 }
 
 function handleReceiverMessage(stationKey, ws, data, isBinary) {
-  /*
-   * Receivers normally do not need to send messages.
-   * Respond to a JSON status request if one is received.
-   */
   if (isBinary) {
     return;
   }
@@ -337,110 +364,111 @@ function handleReceiverMessage(stationKey, ws, data, isBinary) {
   }
 }
 
-function createWebSocketServer() {
-  const wss = new WebSocket.Server({
-    noServer: true,
-    perMessageDeflate: false,
-    maxPayload: 50 * 1024 * 1024
+const wss = new WebSocket.Server({
+  noServer: true,
+  perMessageDeflate: false,
+  maxPayload: 50 * 1024 * 1024
+});
+
+wss.on("connection", (ws, request, stationKey, role) => {
+  const room = STATIONS[stationKey];
+
+  ws.stationKey = stationKey;
+  ws.role = role;
+  ws.ip = getClientIp(request);
+  ws.connectedAt = now();
+  ws.registered = false;
+  ws.isAlive = true;
+
+  ws.on("pong", () => {
+    ws.isAlive = true;
   });
 
-  wss.on("connection", (ws, request, stationKey, role) => {
-    const room = STATIONS[stationKey];
+  if (role === "transmitter") {
+    log(
+      `[+] TRANSMITTER ${stationKey} connected from ${ws.ip}`
+    );
 
-    ws.stationKey = stationKey;
-    ws.role = role;
-    ws.ip = getClientIp(request);
-    ws.connectedAt = now();
-    ws.registered = false;
-    ws.isAlive = true;
+    /*
+     * IMPORTANT:
+     * Do not send registration-required here.
+     * The Python transmitter expects to send its registration
+     * immediately after the WebSocket connection opens.
+     */
 
-    ws.on("pong", () => {
-      ws.isAlive = true;
+    ws.on("message", (data, isBinary) => {
+      handleTransmitterMessage(
+        stationKey,
+        ws,
+        data,
+        isBinary
+      );
     });
 
-    if (role === "transmitter") {
+    ws.on("close", (code, reason) => {
       log(
-        `[+] TRANSMITTER ${stationKey} connected from ${ws.ip}`
+        `[${stationKey}] Transmitter socket closed. ` +
+        `Code: ${code}, Reason: ${
+          reason ? reason.toString() : "(none)"
+        }`
       );
 
-      /*
-       * Do not assign the transmitter slot until valid registration
-       * has been received.
-       */
-      sendJson(ws, {
-        type: "registration-required",
-        station: stationKey,
-        endpoint: room.txPath
-      });
+      clearTransmitter(stationKey, ws);
+    });
 
-      ws.on("message", (data, isBinary) => {
-        handleTransmitterMessage(
-          stationKey,
-          ws,
-          data,
-          isBinary
-        );
-      });
+    ws.on("error", (error) => {
+      log(
+        `[${stationKey}] Transmitter socket error:`,
+        error.message
+      );
+    });
 
-      ws.on("close", () => {
-        clearTransmitter(stationKey, ws);
-      });
+    return;
+  }
 
-      ws.on("error", (error) => {
-        log(
-          `[${stationKey}] Transmitter socket error:`,
-          error.message
-        );
-      });
+  if (role === "receiver") {
+    room.receivers.add(ws);
 
-      return;
-    }
+    log(
+      `[+] RECEIVER ${stationKey} connected from ${ws.ip}`
+    );
 
-    if (role === "receiver") {
-      room.receivers.add(ws);
+    sendJson(ws, {
+      type: "receiver-connected",
+      station: stationKey,
+      endpoint: room.rxPath
+    });
+
+    sendReceiverStatus(stationKey, ws);
+
+    ws.on("message", (data, isBinary) => {
+      handleReceiverMessage(
+        stationKey,
+        ws,
+        data,
+        isBinary
+      );
+    });
+
+    ws.on("close", (code, reason) => {
+      room.receivers.delete(ws);
 
       log(
-        `[+] RECEIVER ${stationKey} connected from ${ws.ip}`
+        `[-] RECEIVER ${stationKey} disconnected. ` +
+        `Code: ${code}, Reason: ${
+          reason ? reason.toString() : "(none)"
+        }`
       );
+    });
 
-      sendJson(ws, {
-        type: "receiver-connected",
-        station: stationKey,
-        endpoint: room.rxPath
-      });
-
-      sendReceiverStatus(stationKey, ws);
-
-      ws.on("message", (data, isBinary) => {
-        handleReceiverMessage(
-          stationKey,
-          ws,
-          data,
-          isBinary
-        );
-      });
-
-      ws.on("close", () => {
-        room.receivers.delete(ws);
-
-        log(
-          `[-] RECEIVER ${stationKey} disconnected`
-        );
-      });
-
-      ws.on("error", (error) => {
-        log(
-          `[${stationKey}] Receiver socket error:`,
-          error.message
-        );
-      });
-    }
-  });
-
-  return wss;
-}
-
-const wss = createWebSocketServer();
+    ws.on("error", (error) => {
+      log(
+        `[${stationKey}] Receiver socket error:`,
+        error.message
+      );
+    });
+  }
+});
 
 const server = http.createServer((request, response) => {
   const url = new URL(
@@ -454,13 +482,11 @@ const server = http.createServer((request, response) => {
       "Cache-Control": "no-store"
     });
 
-    response.end(
-      JSON.stringify({
-        ok: true,
-        service: "AudioBridge",
-        time: now()
-      })
-    );
+    response.end(JSON.stringify({
+      ok: true,
+      service: "AudioBridge",
+      time: now()
+    }));
 
     return;
   }
@@ -471,36 +497,34 @@ const server = http.createServer((request, response) => {
       "Cache-Control": "no-store"
     });
 
-    response.end(
-      JSON.stringify({
-        ok: true,
-        service: "AudioBridge",
-        time: now(),
-        stations: {
-          AM: getPublicStationStatus("AM"),
-          FM: getPublicStationStatus("FM")
-        }
-      })
-    );
+    response.end(JSON.stringify({
+      ok: true,
+      service: "AudioBridge",
+      time: now(),
+      stations: {
+        AM: getPublicStationStatus("AM"),
+        FM: getPublicStationStatus("FM")
+      }
+    }));
 
     return;
   }
 
-  if (
-    url.pathname === "/amtx" ||
-    url.pathname === "/amrx" ||
-    url.pathname === "/fmtx" ||
-    url.pathname === "/fmrx"
-  ) {
+  const websocketPaths = [
+    "/amtx",
+    "/amrx",
+    "/fmtx",
+    "/fmrx"
+  ];
+
+  if (websocketPaths.includes(url.pathname)) {
     response.writeHead(426, {
       "Content-Type": "application/json"
     });
 
-    response.end(
-      JSON.stringify({
-        error: "WebSocket upgrade required"
-      })
-    );
+    response.end(JSON.stringify({
+      error: "WebSocket upgrade required"
+    }));
 
     return;
   }
@@ -521,18 +545,26 @@ server.on("upgrade", (request, socket, head) => {
   let stationKey = null;
   let role = null;
 
-  if (url.pathname === "/amtx") {
-    stationKey = "AM";
-    role = "transmitter";
-  } else if (url.pathname === "/amrx") {
-    stationKey = "AM";
-    role = "receiver";
-  } else if (url.pathname === "/fmtx") {
-    stationKey = "FM";
-    role = "transmitter";
-  } else if (url.pathname === "/fmrx") {
-    stationKey = "FM";
-    role = "receiver";
+  switch (url.pathname) {
+    case "/amtx":
+      stationKey = "AM";
+      role = "transmitter";
+      break;
+
+    case "/amrx":
+      stationKey = "AM";
+      role = "receiver";
+      break;
+
+    case "/fmtx":
+      stationKey = "FM";
+      role = "transmitter";
+      break;
+
+    case "/fmrx":
+      stationKey = "FM";
+      role = "receiver";
+      break;
   }
 
   if (!stationKey || !role) {
@@ -562,13 +594,9 @@ server.on("upgrade", (request, socket, head) => {
   );
 });
 
-/*
- * Heartbeat to clean up dead WebSocket connections.
- */
 const heartbeatTimer = setInterval(() => {
   for (const stationKey of Object.keys(STATIONS)) {
     const room = STATIONS[stationKey];
-
     const sockets = [];
 
     if (room.transmitter) {
@@ -629,7 +657,10 @@ function shutdown(signal) {
 
     if (room.transmitter) {
       try {
-        room.transmitter.close(1001, "Server shutting down");
+        room.transmitter.close(
+          1001,
+          "Server shutting down"
+        );
       } catch (error) {
         // Ignore close errors
       }
@@ -637,7 +668,10 @@ function shutdown(signal) {
 
     for (const receiver of room.receivers) {
       try {
-        receiver.close(1001, "Server shutting down");
+        receiver.close(
+          1001,
+          "Server shutting down"
+        );
       } catch (error) {
         // Ignore close errors
       }
