@@ -3,14 +3,27 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
 
+// ============================================================
+// SERVER CONFIGURATION
+// ============================================================
+
+const SERVER_NAME = "AudioBridge";
+const SERVER_VERSION = "3.0.0";
+
+const REGISTRATION_TIMEOUT_MS = 10000;
+const HEARTBEAT_INTERVAL_MS = 30000;
+
+// Prevent a slow receiver from accumulating unlimited audio.
+const MAX_RECEIVER_BUFFERED_BYTES = 2 * 1024 * 1024;
 
 // ============================================================
 // ROOMS
 // ============================================================
 
 const rooms = {
-
     am: {
+        name: "AM",
+
         transmitters: new Set(),
         receivers: new Set(),
 
@@ -21,6 +34,8 @@ const rooms = {
     },
 
     fm: {
+        name: "FM",
+
         transmitters: new Set(),
         receivers: new Set(),
 
@@ -29,8 +44,107 @@ const rooms = {
             channels: 2
         }
     }
-
 };
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function sendJson(ws, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+
+    try {
+        ws.send(JSON.stringify(payload));
+        return true;
+    } catch (error) {
+        console.error("[WS JSON SEND ERROR]", error.message);
+        return false;
+    }
+}
+
+
+function getRoomFromPath(pathname) {
+    if (
+        pathname === "/amtx" ||
+        pathname === "/amrx"
+    ) {
+        return "am";
+    }
+
+    if (
+        pathname === "/fmtx" ||
+        pathname === "/fmrx"
+    ) {
+        return "fm";
+    }
+
+    return null;
+}
+
+
+function isTransmitterPath(pathname) {
+    return (
+        pathname === "/amtx" ||
+        pathname === "/fmtx"
+    );
+}
+
+
+function isReceiverPath(pathname) {
+    return (
+        pathname === "/amrx" ||
+        pathname === "/fmrx"
+    );
+}
+
+
+function removeFromRoom(ws) {
+    if (!ws || !ws.stationRoom) {
+        return;
+    }
+
+    const room = rooms[ws.stationRoom];
+
+    if (!room) {
+        return;
+    }
+
+    room.transmitters.delete(ws);
+    room.receivers.delete(ws);
+}
+
+
+function closeSocket(ws, code, reason) {
+    try {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.close(code, reason);
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+            ws.terminate();
+        }
+    } catch (error) {
+        try {
+            ws.terminate();
+        } catch (_) {
+            // Ignore.
+        }
+    }
+}
+
+
+function getActiveCasterId(room) {
+    for (const tx of room.transmitters) {
+        if (
+            tx.registered &&
+            tx.casterId
+        ) {
+            return tx.casterId;
+        }
+    }
+
+    return null;
+}
 
 
 // ============================================================
@@ -39,10 +153,27 @@ const rooms = {
 
 const server = http.createServer((req, res) => {
 
-    const url = new URL(
-        req.url,
-        `http://${req.headers.host || "localhost"}`
-    );
+    let url;
+
+    try {
+        url = new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+        );
+    } catch (error) {
+
+        res.writeHead(400, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache"
+        });
+
+        res.end(JSON.stringify({
+            status: "error",
+            error: "Invalid URL"
+        }));
+
+        return;
+    }
 
 
     // --------------------------------------------------------
@@ -57,25 +188,19 @@ const server = http.createServer((req, res) => {
         });
 
         res.end(JSON.stringify({
-
             status: "ok",
-
-            service: "AudioBridge",
-
+            service: SERVER_NAME,
+            version: SERVER_VERSION,
             websocket: true,
 
             endpoints: {
-
                 amtx: "/amtx",
                 amrx: "/amrx",
-
                 fmtx: "/fmtx",
                 fmrx: "/fmrx"
-
             },
 
             timestamp: new Date().toISOString()
-
         }));
 
         return;
@@ -95,38 +220,41 @@ const server = http.createServer((req, res) => {
 
         res.end(JSON.stringify({
 
-            service: "AudioBridge",
+            service: SERVER_NAME,
+            version: SERVER_VERSION,
 
             am: {
-
                 transmitters:
                     rooms.am.transmitters.size,
 
                 receivers:
                     rooms.am.receivers.size,
 
+                activeCasterId:
+                    getActiveCasterId(rooms.am),
+
                 sampleRate:
                     rooms.am.config.sampleRate,
 
                 channels:
                     rooms.am.config.channels
-
             },
 
             fm: {
-
                 transmitters:
                     rooms.fm.transmitters.size,
 
                 receivers:
                     rooms.fm.receivers.size,
 
+                activeCasterId:
+                    getActiveCasterId(rooms.fm),
+
                 sampleRate:
                     rooms.fm.config.sampleRate,
 
                 channels:
                     rooms.fm.config.channels
-
             },
 
             timestamp:
@@ -143,19 +271,15 @@ const server = http.createServer((req, res) => {
     // --------------------------------------------------------
 
     res.writeHead(200, {
-
-        "Content-Type":
-            "text/plain",
-
-        "Cache-Control":
-            "no-cache"
-
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache"
     });
 
-
     res.end(
-
         "AudioBridge Multi-Stream Server Running\n\n" +
+
+        "Server:\n" +
+        `${SERVER_NAME} ${SERVER_VERSION}\n\n` +
 
         "WebSocket Endpoints:\n\n" +
 
@@ -174,9 +298,7 @@ const server = http.createServer((req, res) => {
         "HTTP:\n" +
         "/health\n" +
         "/status\n"
-
     );
-
 });
 
 
@@ -189,10 +311,11 @@ const wss = new WebSocket.Server({
     noServer: true,
 
     // Audio should NOT be compressed.
-    // This reduces CPU usage and latency.
+    // Compression adds CPU overhead and latency.
+    perMessageDeflate: false,
 
-    perMessageDeflate: false
-
+    // Prevent excessive incoming WebSocket frame sizes.
+    maxPayload: 2 * 1024 * 1024
 });
 
 
@@ -204,25 +327,19 @@ server.on("upgrade", (request, socket, head) => {
 
     let url;
 
-
     try {
 
         url = new URL(
-
             request.url,
-
             `http://${request.headers.host || "localhost"}`
-
         );
 
     } catch (error) {
 
         socket.write(
-
             "HTTP/1.1 400 Bad Request\r\n" +
             "Connection: close\r\n" +
             "\r\n"
-
         );
 
         socket.destroy();
@@ -235,29 +352,24 @@ server.on("upgrade", (request, socket, head) => {
         url.pathname.toLowerCase();
 
 
-    // ========================================================
+    // --------------------------------------------------------
     // VALID ENDPOINTS
-    // ========================================================
+    // --------------------------------------------------------
 
     const validPaths = new Set([
-
         "/amtx",
         "/amrx",
-
         "/fmtx",
         "/fmrx"
-
     ]);
 
 
     if (!validPaths.has(pathname)) {
 
         socket.write(
-
             "HTTP/1.1 404 Not Found\r\n" +
             "Connection: close\r\n" +
             "\r\n"
-
         );
 
         socket.destroy();
@@ -266,34 +378,24 @@ server.on("upgrade", (request, socket, head) => {
     }
 
 
-    // ========================================================
+    // --------------------------------------------------------
     // HANDLE WEBSOCKET
-    // ========================================================
+    // --------------------------------------------------------
 
     wss.handleUpgrade(
-
         request,
-
         socket,
-
         head,
-
         (ws) => {
 
             wss.emit(
-
                 "connection",
-
                 ws,
-
                 request
-
             );
 
         }
-
     );
-
 });
 
 
@@ -304,33 +406,25 @@ server.on("upgrade", (request, socket, head) => {
 wss.on("connection", (ws, req) => {
 
     const clientIp =
-
         req.headers["x-forwarded-for"] ||
-
         req.socket.remoteAddress;
 
 
     let url;
 
-
     try {
 
         url = new URL(
-
             req.url,
-
             `http://${req.headers.host || "localhost"}`
-
         );
 
     } catch (error) {
 
-        ws.close(
-
+        closeSocket(
+            ws,
             1008,
-
             "Invalid URL"
-
         );
 
         return;
@@ -345,51 +439,16 @@ wss.on("connection", (ws, req) => {
     // DETERMINE STATION
     // ========================================================
 
-    let station = null;
+    const station =
+        getRoomFromPath(pathname);
 
-
-    if (
-
-        pathname === "/amtx" ||
-
-        pathname === "/amrx"
-
-    ) {
-
-        station = "am";
-
-    }
-
-
-    if (
-
-        pathname === "/fmtx" ||
-
-        pathname === "/fmrx"
-
-    ) {
-
-        station = "fm";
-
-    }
-
-
-    // ========================================================
-    // DETERMINE ROLE
-    // ========================================================
 
     const isTransmitter =
-
-        pathname === "/amtx" ||
-
-        pathname === "/fmtx";
+        isTransmitterPath(pathname);
 
 
     const isReceiver =
-
-        pathname === "/amrx" ||
-
-        pathname === "/fmrx";
+        isReceiverPath(pathname);
 
 
     // ========================================================
@@ -397,42 +456,18 @@ wss.on("connection", (ws, req) => {
     // ========================================================
 
     if (
-
         !station ||
-
         (!isTransmitter && !isReceiver)
-
     ) {
 
-        ws.close(
-
+        closeSocket(
+            ws,
             1008,
-
             "Invalid WebSocket endpoint"
-
         );
 
         return;
     }
-
-
-    // ========================================================
-    // STORE CLIENT INFORMATION
-    // ========================================================
-
-    ws.stationRoom =
-        station;
-
-
-    ws.isTransmitter =
-        isTransmitter;
-
-
-    ws.isReceiver =
-        isReceiver;
-
-
-    ws.isAlive = true;
 
 
     const room =
@@ -440,19 +475,45 @@ wss.on("connection", (ws, req) => {
 
 
     // ========================================================
-    // CONNECTION LOG
+    // CLIENT STATE
     // ========================================================
 
+    ws.stationRoom = station;
+
+    ws.endpoint = pathname;
+
+    ws.isTransmitter =
+        isTransmitter;
+
+    ws.isReceiver =
+        isReceiver;
+
+    ws.registered =
+        !isTransmitter;
+
+    ws.casterId = null;
+
+    ws.stationName = null;
+
+    ws.format = null;
+
+    ws.bitrate = null;
+
+    ws.sampleRate =
+        room.config.sampleRate;
+
+    ws.channels =
+        room.config.channels;
+
+    ws.isAlive = true;
+
+    ws.registrationTimer = null;
+
+
     console.log(
-
-        `[+] ` +
-
-        `${isTransmitter ? "TRANSMITTER" : "RECEIVER"} ` +
-
+        `[+] ${isTransmitter ? "TRANSMITTER" : "RECEIVER"} ` +
         `${station.toUpperCase()} ` +
-
         `connected from ${clientIp}`
-
     );
 
 
@@ -461,62 +522,8 @@ wss.on("connection", (ws, req) => {
     // ========================================================
 
     ws.on("pong", () => {
-
         ws.isAlive = true;
-
     });
-
-
-    // ========================================================
-    // TRANSMITTER
-    // ========================================================
-
-    if (isTransmitter) {
-
-        room.transmitters.add(ws);
-
-
-        console.log(
-
-            `[TX ${station.toUpperCase()}] ` +
-
-            `Active transmitters: ` +
-
-            `${room.transmitters.size}`
-
-        );
-
-
-        // Send status/configuration
-
-        ws.send(
-
-            JSON.stringify({
-
-                type: "status",
-
-                role: "transmitter",
-
-                station:
-                    station.toUpperCase(),
-
-                sampleRate:
-                    room.config.sampleRate,
-
-                channels:
-                    room.config.channels,
-
-                endpoint:
-                    pathname,
-
-                server:
-                    "AudioBridge"
-
-            })
-
-        );
-
-    }
 
 
     // ========================================================
@@ -527,30 +534,365 @@ wss.on("connection", (ws, req) => {
 
         room.receivers.add(ws);
 
-
         console.log(
-
             `[RX ${station.toUpperCase()}] ` +
-
-            `Active receivers: ` +
-
-            `${room.receivers.size}`
-
+            `Receiver connected. ` +
+            `Active receivers: ${room.receivers.size}`
         );
 
 
-        // Send status/configuration
+        sendJson(ws, {
+            type: "status",
+            role: "receiver",
+            station: station.toUpperCase(),
+            sampleRate: room.config.sampleRate,
+            channels: room.config.channels,
+            endpoint: pathname,
+            server: SERVER_NAME,
+            version: SERVER_VERSION
+        });
+    }
 
-        ws.send(
 
-            JSON.stringify({
+    // ========================================================
+    // TRANSMITTER
+    // ========================================================
 
-                type: "status",
+    if (isTransmitter) {
 
-                role: "receiver",
+        /*
+         * IMPORTANT:
+         *
+         * Do NOT add the transmitter to room.transmitters yet.
+         *
+         * The caster must first send:
+         *
+         * register-transmitter
+         *
+         * and receive:
+         *
+         * transmitter-accepted
+         */
+
+        ws.registrationTimer =
+            setTimeout(() => {
+
+                if (
+                    ws.readyState === WebSocket.OPEN &&
+                    !ws.registered
+                ) {
+
+                    console.log(
+                        `[TX ${station.toUpperCase()}] ` +
+                        `Registration timeout from ${clientIp}`
+                    );
+
+                    sendJson(ws, {
+                        type: "transmitter-rejected",
+                        reason: "REGISTRATION_TIMEOUT"
+                    });
+
+                    closeSocket(
+                        ws,
+                        1008,
+                        "Transmitter registration timeout"
+                    );
+                }
+
+            }, REGISTRATION_TIMEOUT_MS);
+    }
+
+
+    // ========================================================
+    // RECEIVE DATA
+    // ========================================================
+
+    ws.on("message", (message, isBinary) => {
+
+        // ====================================================
+        // RECEIVER CANNOT SEND DATA
+        // ====================================================
+
+        if (ws.isReceiver) {
+
+            console.warn(
+                `[RX ${station.toUpperCase()}] ` +
+                `Ignored data from receiver`
+            );
+
+            return;
+        }
+
+
+        // ====================================================
+        // TRANSMITTER REGISTRATION
+        // ====================================================
+
+        if (
+            ws.isTransmitter &&
+            !ws.registered
+        ) {
+
+            if (isBinary) {
+
+                console.warn(
+                    `[TX ${station.toUpperCase()}] ` +
+                    `Binary data received before registration`
+                );
+
+                sendJson(ws, {
+                    type: "transmitter-rejected",
+                    reason: "REGISTRATION_REQUIRED"
+                });
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "Register transmitter before sending audio"
+                );
+
+                return;
+            }
+
+
+            let payload;
+
+            try {
+
+                payload =
+                    JSON.parse(
+                        message.toString()
+                    );
+
+            } catch (error) {
+
+                sendJson(ws, {
+                    type: "transmitter-rejected",
+                    reason: "INVALID_REGISTRATION_JSON"
+                });
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "Invalid registration JSON"
+                );
+
+                return;
+            }
+
+
+            if (
+                !payload ||
+                payload.type !==
+                    "register-transmitter"
+            ) {
+
+                sendJson(ws, {
+                    type: "transmitter-rejected",
+                    reason: "REGISTRATION_REQUIRED"
+                });
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "register-transmitter required"
+                );
+
+                return;
+            }
+
+
+            // =================================================
+            // VALIDATE CASTER ID
+            // =================================================
+
+            const casterId =
+                String(
+                    payload.casterId || ""
+                ).trim();
+
+
+            if (!casterId) {
+
+                sendJson(ws, {
+                    type: "transmitter-rejected",
+                    reason: "MISSING_CASTER_ID"
+                });
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "casterId is required"
+                );
+
+                return;
+            }
+
+
+            // =================================================
+            // VALIDATE CHANNEL
+            // =================================================
+
+            const requestedChannel =
+                String(
+                    payload.channel || ""
+                )
+                .trim()
+                .toLowerCase();
+
+
+            if (
+                requestedChannel &&
+                requestedChannel !== station
+            ) {
+
+                sendJson(ws, {
+                    type: "transmitter-rejected",
+                    reason: "CHANNEL_MISMATCH",
+                    expectedChannel:
+                        station.toUpperCase()
+                });
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "Channel does not match endpoint"
+                );
+
+                return;
+            }
+
+
+            // =================================================
+            // ONLY ONE ACTIVE TRANSMITTER PER ROOM
+            // =================================================
+
+            const existingTransmitter =
+                Array.from(
+                    room.transmitters
+                ).find(
+                    tx =>
+                        tx.registered &&
+                        tx.readyState ===
+                            WebSocket.OPEN
+                );
+
+
+            if (existingTransmitter) {
+
+                const activeCasterId =
+                    existingTransmitter.casterId ||
+                    "UNKNOWN";
+
+
+                console.log(
+                    `[TX ${station.toUpperCase()}] ` +
+                    `Rejected ${casterId}; ` +
+                    `active transmitter: ${activeCasterId}`
+                );
+
+
+                sendJson(ws, {
+
+                    type:
+                        "transmitter-rejected",
+
+                    reason:
+                        "ANOTHER_TX_ACTIVE",
+
+                    activeCasterId:
+                        activeCasterId
+                });
+
+
+                closeSocket(
+                    ws,
+                    1008,
+                    "Another transmitter is already active"
+                );
+
+                return;
+            }
+
+
+            // =================================================
+            // ACCEPT REGISTRATION
+            // =================================================
+
+            ws.casterId =
+                casterId;
+
+            ws.stationName =
+                String(
+                    payload.station || ""
+                ).trim();
+
+            ws.format =
+                String(
+                    payload.format || "Opus"
+                ).trim();
+
+            ws.bitrate =
+                String(
+                    payload.bitrate || "128 kbps"
+                ).trim();
+
+            ws.sampleRate =
+                Number(
+                    payload.sampleRate ||
+                    room.config.sampleRate
+                );
+
+            ws.channels =
+                Number(
+                    payload.channels ||
+                    room.config.channels
+                );
+
+            ws.registered = true;
+
+
+            if (ws.registrationTimer) {
+
+                clearTimeout(
+                    ws.registrationTimer
+                );
+
+                ws.registrationTimer = null;
+            }
+
+
+            room.transmitters.add(ws);
+
+
+            console.log(
+                `[TX ${station.toUpperCase()}] ` +
+                `ACCEPTED caster=${ws.casterId} ` +
+                `station="${ws.stationName}" ` +
+                `format=${ws.format} ` +
+                `bitrate=${ws.bitrate} ` +
+                `sampleRate=${ws.sampleRate} ` +
+                `channels=${ws.channels}`
+            );
+
+
+            // =================================================
+            // ACCEPT RESPONSE
+            // =================================================
+
+            sendJson(ws, {
+
+                type:
+                    "transmitter-accepted",
+
+                role:
+                    "transmitter",
 
                 station:
                     station.toUpperCase(),
+
+                casterId:
+                    ws.casterId,
 
                 sampleRate:
                     room.config.sampleRate,
@@ -562,106 +904,177 @@ wss.on("connection", (ws, req) => {
                     pathname,
 
                 server:
-                    "AudioBridge"
+                    SERVER_NAME,
 
-            })
-
-        );
-
-    }
+                version:
+                    SERVER_VERSION
+            });
 
 
-    // ========================================================
-    // RECEIVE DATA FROM TRANSMITTER
-    // ========================================================
-
-    ws.on("message", (message, isBinary) => {
-
-        // ----------------------------------------------------
-        // RECEIVERS CANNOT SEND AUDIO
-        // ----------------------------------------------------
-
-        if (!ws.isTransmitter) {
+            // =================================================
+            // DO NOT PROCESS REGISTRATION AS AUDIO
+            // =================================================
 
             return;
-
         }
 
+
+        // ====================================================
+        // TRANSMITTER MUST BE REGISTERED
+        // ====================================================
+
+        if (
+            ws.isTransmitter &&
+            !ws.registered
+        ) {
+
+            return;
+        }
+
+
+        // ====================================================
+        // ONLY BINARY AUDIO IS ACCEPTED AFTER REGISTRATION
+        // ====================================================
+
+        if (!isBinary) {
+
+            console.warn(
+                `[TX ${station.toUpperCase()}] ` +
+                `Ignoring non-binary message ` +
+                `from ${ws.casterId || "unknown"}`
+            );
+
+            return;
+        }
+
+
+        // ====================================================
+        // CURRENT ROOM
+        // ====================================================
 
         const currentRoom =
             rooms[ws.stationRoom];
 
 
         if (!currentRoom) {
-
             return;
-
         }
 
 
-        // ----------------------------------------------------
-        // LOG AUDIO PACKET
-        // ----------------------------------------------------
-
-        // Uncomment only for debugging.
-        //
-        // console.log(
-        //     `[AUDIO ${ws.stationRoom.toUpperCase()}]`,
-        //     message.length,
-        //     "bytes"
-        // );
-
-
         // ====================================================
-        // BROADCAST TO RECEIVERS
+        // BROADCAST AUDIO TO RECEIVERS
         // ====================================================
+
+        let delivered = 0;
+        let skipped = 0;
+
 
         currentRoom.receivers.forEach(
-
             (receiver) => {
 
                 if (
-
-                    receiver.readyState ===
-
+                    receiver.readyState !==
                     WebSocket.OPEN
-
                 ) {
+
+                    skipped++;
+                    return;
+                }
+
+
+                // ------------------------------------------------
+                // Protect server from a stalled receiver.
+                // ------------------------------------------------
+
+                if (
+                    receiver.bufferedAmount >
+                    MAX_RECEIVER_BUFFERED_BYTES
+                ) {
+
+                    skipped++;
+
+                    console.warn(
+                        `[RX ${station.toUpperCase()}] ` +
+                        `Slow receiver detected; ` +
+                        `buffered=${receiver.bufferedAmount} bytes`
+                    );
 
                     try {
 
-                        receiver.send(
-
-                            message,
-
-                            {
-
-                                binary:
-                                    isBinary
-
-                            }
-
+                        receiver.close(
+                            1008,
+                            "Receiver too slow"
                         );
 
-                    } catch (error) {
-
-                        console.error(
-
-                            `[SEND ERROR ` +
-
-                            `${ws.stationRoom.toUpperCase()}]`,
-
-                            error.message
-
-                        );
-
+                    } catch (_) {
+                        try {
+                            receiver.terminate();
+                        } catch (_) {
+                            // Ignore.
+                        }
                     }
 
+                    return;
+                }
+
+
+                try {
+
+                    receiver.send(
+                        message,
+                        {
+                            binary: true
+                        }
+                    );
+
+                    delivered++;
+
+                } catch (error) {
+
+                    skipped++;
+
+                    console.error(
+                        `[SEND ERROR ${station.toUpperCase()}] ` +
+                        `${error.message}`
+                    );
+
+                    try {
+                        receiver.terminate();
+                    } catch (_) {
+                        // Ignore.
+                    }
                 }
 
             }
-
         );
+
+
+        // --------------------------------------------------------
+        // Optional low-frequency diagnostic.
+        // Do NOT log every audio packet.
+        // --------------------------------------------------------
+
+        ws.audioPackets =
+            (ws.audioPackets || 0) + 1;
+
+        ws.audioBytes =
+            (ws.audioBytes || 0) +
+            message.length;
+
+        if (
+            ws.audioPackets % 500 === 0
+        ) {
+
+            console.log(
+                `[AUDIO ${station.toUpperCase()}] ` +
+                `caster=${ws.casterId} ` +
+                `packets=${ws.audioPackets} ` +
+                `bytes=${ws.audioBytes} ` +
+                `receivers=${currentRoom.receivers.size} ` +
+                `delivered=${delivered} ` +
+                `skipped=${skipped}`
+            );
+        }
 
     });
 
@@ -670,64 +1083,47 @@ wss.on("connection", (ws, req) => {
     // CLOSE
     // ========================================================
 
-    ws.on("close", (code) => {
+    ws.on("close", (code, reasonBuffer) => {
 
-        const currentRoom =
-            rooms[ws.stationRoom];
+        if (ws.registrationTimer) {
 
+            clearTimeout(
+                ws.registrationTimer
+            );
 
-        if (!currentRoom) {
-
-            return;
-
+            ws.registrationTimer = null;
         }
 
 
-        // ----------------------------------------------------
-        // TRANSMITTER
-        // ----------------------------------------------------
+        const reason =
+            reasonBuffer
+                ? reasonBuffer.toString()
+                : "";
+
+
+        removeFromRoom(ws);
+
 
         if (ws.isTransmitter) {
 
-            currentRoom.transmitters.delete(ws);
-
-
             console.log(
-
                 `[-] TX ` +
-
                 `${ws.stationRoom.toUpperCase()} ` +
-
+                `caster=${ws.casterId || "unregistered"} ` +
                 `disconnected ` +
-
-                `(code ${code})`
-
+                `(code ${code}` +
+                `${reason ? `, reason=${reason}` : ""})`
             );
 
-        }
-
-
-        // ----------------------------------------------------
-        // RECEIVER
-        // ----------------------------------------------------
-
-        if (ws.isReceiver) {
-
-            currentRoom.receivers.delete(ws);
-
+        } else {
 
             console.log(
-
                 `[-] RX ` +
-
                 `${ws.stationRoom.toUpperCase()} ` +
-
                 `disconnected ` +
-
-                `(code ${code})`
-
+                `(code ${code}` +
+                `${reason ? `, reason=${reason}` : ""})`
             );
-
         }
 
     });
@@ -740,11 +1136,9 @@ wss.on("connection", (ws, req) => {
     ws.on("error", (error) => {
 
         console.error(
-
-            `[WS ERROR ${clientIp}]`,
-
+            `[WS ERROR ${station.toUpperCase()} ` +
+            `${ws.casterId || clientIp}]`,
             error.message
-
         );
 
     });
@@ -756,50 +1150,71 @@ wss.on("connection", (ws, req) => {
 // HEARTBEAT TIMER
 // ============================================================
 
-const heartbeatTimer = setInterval(() => {
+const heartbeatTimer =
+    setInterval(() => {
 
-    wss.clients.forEach((ws) => {
+        wss.clients.forEach((ws) => {
 
-        // ----------------------------------------------------
-        // Dead connection
-        // ----------------------------------------------------
-
-        if (ws.isAlive === false) {
-
-            console.log(
-
-                `[TIMEOUT] ` +
-
-                `${ws.stationRoom || "UNKNOWN"} ` +
-
-                `client`
-
-            );
+            if (
+                ws.readyState !==
+                WebSocket.OPEN
+            ) {
+                return;
+            }
 
 
-            ws.terminate();
+            // ------------------------------------------------
+            // Dead connection
+            // ------------------------------------------------
 
-            return;
+            if (ws.isAlive === false) {
 
-        }
+                console.log(
+                    `[TIMEOUT] ` +
+                    `${ws.stationRoom || "UNKNOWN"} ` +
+                    `${ws.casterId || "client"}`
+                );
+
+                try {
+                    ws.terminate();
+                } catch (_) {
+                    // Ignore.
+                }
+
+                return;
+            }
 
 
-        ws.isAlive = false;
+            ws.isAlive = false;
 
 
-        // ----------------------------------------------------
-        // Ping
-        // ----------------------------------------------------
+            // ------------------------------------------------
+            // Ping
+            // ------------------------------------------------
 
-        ws.ping();
+            try {
+                ws.ping();
+            } catch (error) {
 
-    });
+                console.error(
+                    `[PING ERROR]`,
+                    error.message
+                );
 
-}, 30000);
+                try {
+                    ws.terminate();
+                } catch (_) {
+                    // Ignore.
+                }
+            }
+
+        });
+
+    }, HEARTBEAT_INTERVAL_MS);
 
 
 // ============================================================
-// WEBSOCKET CLOSE
+// WEBSOCKET SERVER CLOSE
 // ============================================================
 
 wss.on("close", () => {
@@ -815,10 +1230,15 @@ wss.on("close", () => {
 // GRACEFUL SHUTDOWN
 // ============================================================
 
-process.on("SIGTERM", () => {
+function gracefulShutdown(signal) {
 
     console.log(
-        "SIGTERM received."
+        `${signal} received. Shutting down...`
+    );
+
+
+    clearInterval(
+        heartbeatTimer
     );
 
 
@@ -827,16 +1247,18 @@ process.on("SIGTERM", () => {
         try {
 
             ws.close(
-
                 1001,
-
                 "Server shutting down"
-
             );
 
-        } catch (error) {
+        } catch (_) {
 
-            // Ignore
+            try {
+                ws.terminate();
+            } catch (_) {
+                // Ignore.
+            }
+
         }
 
     });
@@ -852,7 +1274,25 @@ process.on("SIGTERM", () => {
 
     });
 
-});
+
+    // Safety fallback.
+    setTimeout(() => {
+
+        process.exit(0);
+
+    }, 5000);
+}
+
+
+process.on(
+    "SIGTERM",
+    () => gracefulShutdown("SIGTERM")
+);
+
+process.on(
+    "SIGINT",
+    () => gracefulShutdown("SIGINT")
+);
 
 
 // ============================================================
@@ -860,17 +1300,26 @@ process.on("SIGTERM", () => {
 // ============================================================
 
 server.listen(
-
     PORT,
-
     "0.0.0.0",
-
     () => {
 
         console.log("");
-        console.log("======================================");
-        console.log("       AUDIOBRIDGE SERVER");
-        console.log("======================================");
+        console.log(
+            "======================================"
+        );
+
+        console.log(
+            "       AUDIOBRIDGE SERVER"
+        );
+
+        console.log(
+            "======================================"
+        );
+
+        console.log(
+            `VERSION: ${SERVER_VERSION}`
+        );
 
         console.log(
             `PORT: ${PORT}`
@@ -906,6 +1355,26 @@ server.listen(
             "STATUS: /status"
         );
 
+        console.log("");
+
+        console.log(
+            "Registration protocol: ENABLED"
+        );
+
+        console.log(
+            "One active transmitter per station: ENABLED"
+        );
+
+        console.log(
+            "WebSocket heartbeat: ENABLED"
+        );
+
+        console.log(
+            "Audio compression: DISABLED"
+        );
+
+        console.log("");
+
         console.log(
             "======================================"
         );
@@ -913,5 +1382,4 @@ server.listen(
         console.log("");
 
     }
-
 );
